@@ -60,7 +60,14 @@
       <groupId>org.apache.artemis</groupId>
       <artifactId>artemis-jms-client</artifactId>
       <version>${artemis.version}</version>
+      <exclusions>
+        <exclusion>
+          <groupId>org.jgroups</groupId>
+          <artifactId>jgroups</artifactId>
+        </exclusion>
+      </exclusions>
     </dependency>
+
 
     <!-- Logging (use Keycloak) -->
     <dependency>
