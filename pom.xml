@@ -101,11 +101,14 @@
             </goals>
             <configuration>
 
-              <!-- Produce single fat jar -->
+              <!-- 🚀 THIS is the key: replace final artifact -->
               <shadedArtifactAttached>false</shadedArtifactAttached>
 
-              <!-- Avoid broken dependency-reduced pom -->
+              <!-- DO NOT generate dependency reduced pom -->
               <createDependencyReducedPom>false</createDependencyReducedPom>
+
+              <!-- 👇 rename final jar -->
+              <finalName>${project.artifactId}-${project.version}</finalName>
 
               <!-- Remove signature files -->
               <filters>

@@ -33,6 +33,6 @@ jobs:
         with:
           tag_name: v${{ steps.vars.outputs.VERSION }}
           name: Release ${{ steps.vars.outputs.VERSION }}
-          files: target/*.jar
+          files: target/keycloak-artemis-provider-${{ steps.vars.outputs.VERSION }}.jar
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
