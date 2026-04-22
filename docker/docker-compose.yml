@@ -1,0 +1,51 @@
+name: "keycloak-artemis-provider"
+
+services:
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.4.6
+    container_name: keycloak-artemis-provider
+    environment:
+      # ── Keycloak admin credentials ──────────────────────────────────
+      KEYCLOAK_ADMIN: ${KEYCLOAK_ADMIN}
+      KEYCLOAK_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD}
+
+      # ── Artemis provider configuration ──────────────────────────────
+      WEBHOOK_ARTEMIS_URL: tcp://host.docker.internal:61616
+      WEBHOOK_ARTEMIS_USERNAME: ${WEBHOOK_ARTEMIS_USERNAME}
+      WEBHOOK_ARTEMIS_PASSWORD: ${WEBHOOK_ARTEMIS_PASSWORD}
+      WEBHOOK_ARTEMIS_ADDRESS: keycloak.events
+
+      # Optional: restrict which events are forwarded.
+      # Comment out to forward ALL events.
+#      WEBHOOK_EVENTS_TAKEN: LOGIN,LOGIN_ERROR,LOGOUT,REGISTER,UPDATE_PASSWORD
+
+      # ── Keycloak runtime settings ────────────────────────────────────
+      KC_HEALTH_ENABLED: "true"
+      KC_METRICS_ENABLED: "true"
+      KC_LOG_LEVEL: INFO
+
+      KC_DB: postgres
+      KC_DB_URL: jdbc:postgresql://host.docker.internal:5439/kc_new
+      KC_DB_USERNAME: ${KC_DB_USERNAME}
+      KC_DB_PASSWORD: ${KC_DB_PASSWORD}
+      KC_HOSTNAME_STRICT: false
+      KC_HTTP_ENABLED: true
+
+    ports:
+      - "9878:8080"
+    command: start-dev
+    volumes:
+      - ./providers:/opt/keycloak/providers:ro,z
+    networks:
+      - internal
+    restart: on-failure
+
+
+
+# =============================================================================
+# Networks
+# =============================================================================
+networks:
+  internal:
+    driver: bridge
