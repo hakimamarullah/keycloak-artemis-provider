@@ -5,6 +5,8 @@ services:
   keycloak:
     image: quay.io/keycloak/keycloak:26.4.6
     container_name: keycloak-artemis-provider
+    env_file:
+      - .env
     environment:
       # ── Keycloak admin credentials ──────────────────────────────────
       KEYCLOAK_ADMIN: ${KEYCLOAK_ADMIN}
