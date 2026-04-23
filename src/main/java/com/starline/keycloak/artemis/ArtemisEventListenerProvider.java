@@ -1,5 +1,6 @@
 package com.starline.keycloak.artemis;
 
+import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.SerializationFeature;
 import org.jboss.logging.Logger;
@@ -7,6 +8,8 @@ import org.keycloak.events.Event;
 import org.keycloak.events.EventListenerProvider;
 import org.keycloak.events.admin.AdminEvent;
 
+import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 
 /**
@@ -62,14 +65,18 @@ public final class ArtemisEventListenerProvider implements EventListenerProvider
 
         LOG.debugf("Artemis: processing user event '%s'", event.getType());
         // Java 21: use var for local type inference
-        var eventType = event.getType() != null ? event.getType().name() : UNKNOWN;
+        var eventType = Optional.ofNullable(event.getType())
+                .map(Enum::name)
+                .orElse(UNKNOWN);
         if (isNotAllowed(eventType)) {
             LOG.tracef("Artemis: skipping user event '%s' (not in WEBHOOK_EVENTS_TAKEN)", eventType);
             return;
         }
 
         try {
-            var json = MAPPER.writeValueAsString(event);
+            var eventBody = MAPPER.convertValue(event, new TypeReference<Map<String, Object>>() {
+            });
+            eventBody.put("type", eventType);
             var props = Publisher.MessageProperties.forUserEvent(
                     eventType,
                     event.getRealmId(),
@@ -77,6 +84,7 @@ public final class ArtemisEventListenerProvider implements EventListenerProvider
                     event.getUserId(),
                     event.getRealmName());
 
+            var json = MAPPER.writeValueAsString(eventBody);
             publisher.publish(json, props);
 
         } catch (ArtemisPublisher.ArtemisPublishException ex) {
@@ -113,13 +121,16 @@ public final class ArtemisEventListenerProvider implements EventListenerProvider
         }
 
         try {
-            var json = MAPPER.writeValueAsString(adminEvent);
+            var eventBody = MAPPER.convertValue(adminEvent, new TypeReference<Map<String, Object>>() {
+            });
+            eventBody.put("type", eventType);
             var props = Publisher.MessageProperties.forAdminEvent(
                     eventType,
                     adminEvent.getRealmId(),
                     adminEvent.getRealmName());
 
 
+            var json = MAPPER.writeValueAsString(eventBody);
             publisher.publish(json, props);
             LOG.debugf("Artemis: published admin event %s", json);
 
