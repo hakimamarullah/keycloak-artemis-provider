@@ -90,7 +90,7 @@ public final class ArtemisPublisher implements Publisher {
 
         this.topicAddress = config.address();
 
-        LOG.infof("ArtemisPublisherV2 initialised — pool=%d, maxAttempts=%d, broker=%s",
+        LOG.infof("Publisher initialised — pool=%d, maxAttempts=%d, broker=%s",
                 size, config.publishMaxAttempts(), config.brokerUrl());
     }
 

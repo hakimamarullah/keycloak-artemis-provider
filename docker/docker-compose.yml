@@ -3,7 +3,7 @@ name: "keycloak-artemis-provider"
 services:
 
   keycloak:
-    image: quay.io/keycloak/keycloak:26.4.6
+    image: quay.io/keycloak/keycloak:26.6.1
     container_name: keycloak-artemis-provider
     env_file:
       - .env
@@ -25,7 +25,7 @@ services:
       # ── Keycloak runtime settings ────────────────────────────────────
       KC_HEALTH_ENABLED: "true"
       KC_METRICS_ENABLED: "true"
-      KC_LOG_LEVEL: INFO
+      KC_LOG_LEVEL: INFO,com.starline.keycloak.artemis:DEBUG
 
       KC_DB: postgres
       KC_DB_URL: jdbc:postgresql://host.docker.internal:5439/kc_new

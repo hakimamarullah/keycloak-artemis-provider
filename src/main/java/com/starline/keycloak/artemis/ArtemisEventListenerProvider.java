@@ -98,7 +98,7 @@ public final class ArtemisEventListenerProvider implements EventListenerProvider
     public void onEvent(AdminEvent adminEvent, boolean includeRepresentation) {
         if (adminEvent == null) return;
 
-        LOG.debugf("Artemis: processing admin event '%s'", adminEvent.getResourceType());
+
         // Java 21 switch expression with pattern — concise null-safe name extraction
         var resourceType = adminEvent.getResourceType() != null
                 ? adminEvent.getResourceType().name() : UNKNOWN;
@@ -106,6 +106,7 @@ public final class ArtemisEventListenerProvider implements EventListenerProvider
                 ? adminEvent.getOperationType().name() : UNKNOWN;
         var eventType = "%s-%s".formatted(resourceType, operationType);
 
+        LOG.debugf("Artemis: processing admin event '%s'", eventType);
         if (isNotAllowed(eventType)) {
             LOG.tracef("Artemis: skipping admin event '%s' (not in WEBHOOK_EVENTS_TAKEN)", eventType);
             return;
@@ -118,7 +119,9 @@ public final class ArtemisEventListenerProvider implements EventListenerProvider
                     adminEvent.getRealmId(),
                     adminEvent.getRealmName());
 
+
             publisher.publish(json, props);
+            LOG.debugf("Artemis: published admin event %s", json);
 
         } catch (ArtemisPublisher.ArtemisPublishException ex) {
             LOG.errorf(ex, "Artemis: failed to deliver admin event type='%s'", eventType);
