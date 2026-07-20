@@ -1,9 +1,13 @@
 package com.starline.keycloak.artemis;
 
+import jakarta.jms.JMSContext;
+import jakarta.jms.JMSException;
+import jakarta.jms.JMSProducer;
+import jakarta.jms.JMSRuntimeException;
+import jakarta.jms.Topic;
 import org.apache.activemq.artemis.jms.client.ActiveMQConnectionFactory;
 import org.jboss.logging.Logger;
 
-import javax.jms.*;
 import java.io.Serial;
 import java.security.SecureRandom;
 import java.util.ArrayDeque;
@@ -16,30 +20,29 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
- * Thread-safe, resilient JMS publisher for Keycloak event listeners.
+ * Thread-safe, resilient JMS 2.0 publisher for Keycloak event listeners.
  *
- * <h3>Architecture</h3>
+ * <h3>What changed vs. the JMS 1.1 version</h3>
  * <ul>
- *   <li><b>Connection pool</b> — a fixed pool of {@link PooledConnection} slots (size
- *       configurable via {@link DefaultArtemisConfig#poolSize()}). Each slot owns one JMS
- *       {@link Connection} and creates {@link Session}/{@link MessageProducer} on first
- *       use. Broken slots are evicted and rebuilt transparently.</li>
- *   <li><b>Publish retry</b> — transient {@link JMSException}s trigger an exponential
- *       backoff retry loop with configurable attempts, base delay, multiplier, max delay,
- *       and random jitter. Permanent errors (security, invalid destination) are NOT
- *       retried.</li>
- *   <li><b>Transport reconnect</b> — delegated entirely to the Artemis client
- *       ({@code setReconnectAttempts(-1)}). The client heals the underlying transport
- *       silently; the pool layer handles JMS-level session invalidation on top.</li>
+ *   <li>{@link JMSContext} replaces the separate {@code Connection}/{@code Session}/
+ *       {@code MessageProducer} triad — one object now owns the whole lifecycle.</li>
+ *   <li>{@link JMSProducer} (obtained fresh per-send via {@code context.createProducer()})
+ *       replaces {@code MessageProducer}, using its fluent
+ *       {@code setProperty(...).send(destination, body)} API instead of manually building
+ *       a {@code TextMessage}.</li>
+ *   <li>{@link JMSException} (checked) is gone from the send path — JMS 2.0's simplified
+ *       API throws the unchecked {@link JMSRuntimeException} instead, which flattens the
+ *       try/catch structure considerably.</li>
+ *   <li>Connection start/stop is implicit — a {@code JMSContext} created via
+ *       {@code createContext(...)} is auto-started, so there is no {@code conn.start()}
+ *       step.</li>
  * </ul>
  *
- * <h3>Configuration</h3>
- * All tuning knobs live in {@link DefaultArtemisConfig} with documented defaults.
- *
- * <h3>Thread safety</h3>
- * Publish is safe to call from concurrent threads. Each call borrows one pool slot
- * (blocking up to {@link DefaultArtemisConfig#poolAcquireTimeoutMs()} if all slots are busy),
- * sends the message, then returns the slot immediately — even on exception.
+ * <p><b>Why pooling is still needed:</b> a {@link JMSContext} is explicitly documented as
+ * <i>not</i> thread-safe (unlike a plain {@code ConnectionFactory}), so JMS 2.0 does not
+ * remove the need for a pool in a concurrent publisher — it just shrinks what each pool
+ * slot has to hold. The pooling/retry/backoff architecture is unchanged from the JMS 1.1
+ * version.
  */
 public final class ArtemisPublisher implements Publisher {
 
@@ -48,24 +51,13 @@ public final class ArtemisPublisher implements Publisher {
     private final ArtemisConfig config;
     private final ActiveMQConnectionFactory connectionFactory;
 
-    /**
-     * The pool: a bounded stack of available slots.
-     * {@link Semaphore} bounds concurrent borrows; {@link Deque} is the LIFO stack
-     * (LIFO keeps the most-recently-used slot warm, reducing session churn).
-     */
     private final Semaphore poolPermits;
-    private final Deque<PooledConnection> pool;
+    private final Deque<PooledContext> pool;
 
-    /**
-     * Resolved once and reused; topic identity does not change per connection.
-     */
-    private volatile String topicAddress;
+    private final String topicAddress;
 
     private final AtomicBoolean closed = new AtomicBoolean(false);
 
-    /**
-     * Thread-safe random for jitter — ThreadLocalRandom isn't great inside lambdas.
-     */
     private final Random jitterRandom = new SecureRandom();
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -83,9 +75,8 @@ public final class ArtemisPublisher implements Publisher {
         this.poolPermits = new Semaphore(size, true); // fair
         this.pool = new ArrayDeque<>(size);
 
-        // Pre-populate the pool with empty slots (lazily connected).
         for (int i = 0; i < size; i++) {
-            pool.push(new PooledConnection(i));
+            pool.push(new PooledContext(i));
         }
 
         this.topicAddress = config.address();
@@ -112,13 +103,21 @@ public final class ArtemisPublisher implements Publisher {
     public void close() {
         if (!closed.compareAndSet(false, true)) return;
 
-        // Drain every slot that is currently idle in the pool.
-        List<PooledConnection> drained = new ArrayList<>(config.poolSize());
+        // Block until every currently-borrowed slot is returned before tearing down
+        // the shared connectionFactory — see acquireSlot()/returnSlot().
+        try {
+            poolPermits.acquire(config.poolSize());
+        } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+            LOG.warn("Interrupted while waiting for in-flight publishes to finish during close()");
+        }
+
+        List<PooledContext> drained = new ArrayList<>(config.poolSize());
         synchronized (pool) {
             drained.addAll(pool);
             pool.clear();
         }
-        for (PooledConnection slot : drained) {
+        for (PooledContext slot : drained) {
             slot.destroy();
         }
 
@@ -128,7 +127,7 @@ public final class ArtemisPublisher implements Publisher {
             // Do nothing
         }
 
-        LOG.info("ArtemisPublisherV2 closed");
+        LOG.info("ArtemisPublisher closed");
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -142,7 +141,7 @@ public final class ArtemisPublisher implements Publisher {
         long maxDelay = config.publishRetryMaxDelayMs();
         double jitter = config.publishRetryJitterFactor();
 
-        JMSException lastException = null;
+        JMSRuntimeException lastException = null;
 
         for (int attempt = 1; attempt <= maxAttempts; attempt++) {
             try {
@@ -153,11 +152,11 @@ public final class ArtemisPublisher implements Publisher {
                 }
                 return;
 
-            } catch (JMSException ex) {
+            } catch (JMSRuntimeException ex) {
                 lastException = ex;
 
                 if (!isTransient(ex)) {
-                    LOG.errorf(ex, "Non-retryable JMSException on publish (eventType=%s)", properties.eventType());
+                    LOG.errorf(ex, "Non-retryable JMSRuntimeException on publish (eventType=%s)", properties.eventType());
                     throw new ArtemisPublishException("Publish failed (permanent error)", ex);
                 }
 
@@ -169,7 +168,6 @@ public final class ArtemisPublisher implements Publisher {
 
                 sleep(actualDelay);
 
-                // Advance delay for next iteration (capped).
                 delay = Math.min((long) (delay * multiplier), maxDelay);
             }
         }
@@ -182,25 +180,28 @@ public final class ArtemisPublisher implements Publisher {
 
     /**
      * Sends one message. Borrows a pool slot, sends, then returns it.
-     * If the slot is broken, it is destroyed (not returned) and rebuilt on next borrow.
+     *
+     * <p>Note the whole body is now a single fluent {@link JMSProducer} chain — no
+     * {@code TextMessage} construction, no checked {@code JMSException}.
      */
-    private void doPublish(String json, Publisher.MessageProperties properties) throws JMSException {
-        PooledConnection slot = acquireSlot();
+    private void doPublish(String json, Publisher.MessageProperties properties) {
+        PooledContext slot = acquireSlot();
         boolean healthy = false;
 
         try {
             slot.ensureOpen();
 
-            TextMessage msg = slot.session().createTextMessage(json);
-            msg.setStringProperty("eventKind", properties.eventKind());
-            msg.setStringProperty("eventType", properties.eventType());
-            msg.setStringProperty("realmId", properties.realmId());
+            JMSProducer producer = slot.context().createProducer()
+                    .setDeliveryMode(jakarta.jms.DeliveryMode.PERSISTENT)
+                    .setProperty("eventKind", properties.eventKind())
+                    .setProperty("eventType", properties.eventType())
+                    .setProperty("realmId", properties.realmId());
 
-            if (properties.realmName() != null) msg.setStringProperty("realmName", properties.realmName());
-            if (properties.clientId() != null) msg.setStringProperty("clientId", properties.clientId());
-            if (properties.userId() != null) msg.setStringProperty("userId", properties.userId());
+            if (properties.realmName() != null) producer.setProperty("realmName", properties.realmName());
+            if (properties.clientId() != null) producer.setProperty("clientId", properties.clientId());
+            if (properties.userId() != null) producer.setProperty("userId", properties.userId());
 
-            slot.producer().send(msg);
+            producer.send(slot.topic(), json);
             healthy = true;
 
         } finally {
@@ -212,12 +213,7 @@ public final class ArtemisPublisher implements Publisher {
     // Pool management
     // ─────────────────────────────────────────────────────────────────────────
 
-    /**
-     * Blocks until a pool slot is available or the acquire timeout expires.
-     *
-     * @throws ArtemisPublishException if the timeout is exceeded or the thread is interrupted
-     */
-    private PooledConnection acquireSlot() {
+    private PooledContext acquireSlot() {
         try {
             boolean acquired = poolPermits.tryAcquire(
                     config.poolAcquireTimeoutMs(), TimeUnit.MILLISECONDS);
@@ -231,10 +227,8 @@ public final class ArtemisPublisher implements Publisher {
         }
 
         synchronized (pool) {
-            PooledConnection slot = pool.poll();
+            PooledContext slot = pool.poll();
             if (slot == null) {
-                // Semaphore said there's a permit but the deque is empty — should never
-                // happen under correct usage, but guard defensively.
                 poolPermits.release();
                 throw new ArtemisPublishException("Pool deque empty despite available permit", null);
             }
@@ -242,21 +236,16 @@ public final class ArtemisPublisher implements Publisher {
         }
     }
 
-    /**
-     * Returns a slot to the pool. If the publish was unhealthy the slot is destroyed
-     * and replaced with a fresh (unconnected) slot so capacity is never permanently lost.
-     */
-    private void returnSlot(PooledConnection slot, boolean healthy) {
+    private void returnSlot(PooledContext slot, boolean healthy) {
         if (!healthy) {
             slot.destroy();
-            // Rebuild a fresh empty slot so the pool stays at full capacity.
-            slot = new PooledConnection(slot.id());
+            slot = new PooledContext(slot.id());
         }
         synchronized (pool) {
             if (!closed.get()) {
                 pool.push(slot);
             } else {
-                slot.destroy(); // publisher was closed while this slot was in-flight
+                slot.destroy();
             }
         }
         poolPermits.release();
@@ -266,44 +255,28 @@ public final class ArtemisPublisher implements Publisher {
     // Transient vs permanent error classification
     // ─────────────────────────────────────────────────────────────────────────
 
-    /**
-     * Returns {@code true} if the exception is worth retrying.
-     *
-     * <p>Permanent errors (security, invalid destination, illegal state) should not be
-     * retried — they will never succeed without a configuration change.
-     */
-    private static boolean isTransient(JMSException ex) {
+    private static boolean isTransient(JMSRuntimeException ex) {
         String errorCode = ex.getErrorCode();
 
-        // ActiveMQ / Artemis error codes for permanent conditions.
-        // See org.apache.activemq.artemis.api.core.ActiveMQExceptionType
         if (errorCode != null) {
             return switch (errorCode) {
-                // Security / auth
                 case "SECURITY_EXCEPTION",
                      "ACT-CLIENT-SEC-003" -> false;
-                // Destination does not exist and auto-create is off
                 case "QUEUE_DOES_NOT_EXIST",
                      "ADDRESS_DOES_NOT_EXIST" -> false;
-                // Everything else (connection drop, timeout, IO, etc.) is transient
                 default -> true;
             };
         }
 
-        // Fallback: inspect the exception type hierarchy.
-        return !(ex instanceof javax.jms.JMSSecurityException
-                 || ex instanceof javax.jms.InvalidDestinationException
-                 || ex instanceof javax.jms.IllegalStateException);
+        return !(ex instanceof jakarta.jms.JMSSecurityRuntimeException
+                || ex instanceof jakarta.jms.InvalidDestinationRuntimeException
+                || ex instanceof jakarta.jms.IllegalStateRuntimeException);
     }
 
     // ─────────────────────────────────────────────────────────────────────────
     // Helpers
     // ─────────────────────────────────────────────────────────────────────────
 
-    /**
-     * Computes the actual sleep duration: {@code base * (1 + random * jitterFactor)},
-     * ensuring the result is always at least 1ms.
-     */
     private long computeDelay(long base, double jitterFactor) {
         double randomFactor = 1.0 + (jitterFactor > 0 ? jitterRandom.nextDouble() * jitterFactor : 0);
         return Math.max(1L, (long) (base * randomFactor));
@@ -331,28 +304,23 @@ public final class ArtemisPublisher implements Publisher {
     // ─────────────────────────────────────────────────────────────────────────
 
     /**
-     * One slot in the connection pool.
-     *
-     * <p>Lifecycle: created empty → {@link #ensureOpen()} establishes the JMS connection,
-     * session, and producer lazily on first use → {@link #destroy()} tears everything down.
-     *
-     * <p><b>Not thread-safe by itself</b> — the pool contract guarantees only one thread
-     * holds a given slot at a time.
+     * One slot in the connection pool. Where the JMS 1.1 version held a
+     * {@code Connection}/{@code Session}/{@code MessageProducer} triad, this holds a
+     * single {@link JMSContext} plus the resolved {@link Topic}. Producers are created
+     * fresh per-send via {@code context.createProducer()} — cheap, and the recommended
+     * JMS 2.0 pattern (a {@code JMSProducer} is a lightweight, disposable builder, unlike
+     * the heavier JMS 1.1 {@code MessageProducer}).
      */
-    private final class PooledConnection {
+    private final class PooledContext {
 
         private final int id;
 
-        private Connection connection;
-        private Session session;
-        private MessageProducer producer;
+        private JMSContext context;
+        private Topic topic;
 
-        /**
-         * Set by the ExceptionListener; checked in ensureOpen() before reuse.
-         */
         private volatile boolean markedBroken = false;
 
-        PooledConnection(int id) {
+        PooledContext(int id) {
             this.id = id;
         }
 
@@ -360,74 +328,46 @@ public final class ArtemisPublisher implements Publisher {
             return id;
         }
 
-        Session session() {
-            return session;
+        JMSContext context() {
+            return context;
         }
 
-        MessageProducer producer() {
-            return producer;
+        Topic topic() {
+            return topic;
         }
 
-        /**
-         * Ensures this slot has a live connection/session/producer.
-         * If the connection was marked broken by the ExceptionListener it is rebuilt.
-         */
-        void ensureOpen() throws JMSException {
-            if (markedBroken || connection == null) {
+        void ensureOpen() {
+            if (markedBroken || context == null) {
                 rebuild();
             }
         }
 
-        private void rebuild() throws JMSException {
-            // Tear down whatever is stale.
-            closeQuietly(producer);
-            closeQuietly(session);
-            closeQuietly(connection);
-            producer = null;
-            session = null;
-            connection = null;
+        private void rebuild() {
+            closeQuietly(context);
+            context = null;
+            topic = null;
             markedBroken = false;
 
-            Connection conn = null;
-            try {
-                conn = connectionFactory.createConnection(config.username(), config.password());
+            // createContext(...) opens the connection, session, and starts delivery in
+            // one call — no separate conn.start().
+            JMSContext ctx = connectionFactory.createContext(
+                    config.username(), config.password(), JMSContext.AUTO_ACKNOWLEDGE);
 
-                // Mark this slot broken on any async JMS error so it gets rebuilt on next borrow.
-                conn.setExceptionListener(ex -> {
-                    LOG.warnf("Pool slot #%d connection error — marking broken: %s", id, ex.getMessage());
-                    markedBroken = true;
-                });
+            ctx.setExceptionListener(ex -> {
+                LOG.warnf("Pool slot #%d connection error — marking broken: %s", id, ex.getMessage());
+                markedBroken = true;
+            });
 
-                Session sess = conn.createSession(false, Session.AUTO_ACKNOWLEDGE);
-                Topic t = sess.createTopic(topicAddress);
-                MessageProducer prod = sess.createProducer(t);
-                prod.setDeliveryMode(DeliveryMode.PERSISTENT);
+            this.context = ctx;
+            this.topic = ctx.createTopic(topicAddress);
 
-                conn.start();
-
-                // Assign atomically (all or nothing).
-                this.connection = conn;
-                this.session = sess;
-                this.producer = prod;
-
-                LOG.debugf("Pool slot #%d opened (topic=%s)", id, topicAddress);
-
-            } catch (JMSException ex) {
-                closeQuietly(conn); // prevent leak on partial init
-                throw ex;
-            }
+            LOG.debugf("Pool slot #%d opened (topic=%s)", id, topicAddress);
         }
 
-        /**
-         * Closes all JMS resources held by this slot. Idempotent.
-         */
         void destroy() {
-            closeQuietly(producer);
-            closeQuietly(session);
-            closeQuietly(connection);
-            producer = null;
-            session = null;
-            connection = null;
+            closeQuietly(context);
+            context = null;
+            topic = null;
             LOG.debugf("Pool slot #%d destroyed", id);
         }
     }

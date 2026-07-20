@@ -137,7 +137,6 @@ public final class ArtemisEventListenerProviderFactory implements EventListenerP
         return Arrays.stream(taken.split(","))
                 .map(String::trim)
                 .filter(s -> !s.isEmpty())
-                // Java 21: Collectors.toUnmodifiableSet() — immutable, no defensive copy needed
                 .collect(Collectors.toUnmodifiableSet());
     }
 }
